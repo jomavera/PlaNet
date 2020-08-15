@@ -9,26 +9,45 @@ class MPCPlanner(jit.ScriptModule):
 
   def __init__(self, action_size, planning_horizon, optimisation_iters, candidates, top_candidates, transition_model, reward_model, min_action=-inf, max_action=inf):
     super().__init__()
-    self.transition_model, self.reward_model = transition_model, reward_model
+    self.transition_model, self.reward_model           = transition_model, reward_model
     self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
-    self.planning_horizon = planning_horizon
-    self.optimisation_iters = optimisation_iters
-    self.candidates, self.top_candidates = candidates, top_candidates
+    self.planning_horizon                              = planning_horizon
+    self.optimisation_iters                            = optimisation_iters
+    self.candidates, self.top_candidates               = candidates, top_candidates
 
   @jit.script_method
   def forward(self, belief, state):
+    # INPUT: h_t, post_s_t
+    #
+    # B = batch_size
+    # H = hidden_size
+    # Z = state_size
+
     B, H, Z = belief.size(0), belief.size(1), state.size(1)
     belief, state = belief.unsqueeze(dim=1).expand(B, self.candidates, H).reshape(-1, H), state.unsqueeze(dim=1).expand(B, self.candidates, Z).reshape(-1, Z)
+
+
     # Initialize factorized belief over action sequences q(a_t:t+H) ~ N(0, I)
     action_mean, action_std_dev = torch.zeros(self.planning_horizon, B, 1, self.action_size, device=belief.device), torch.ones(self.planning_horizon, B, 1, self.action_size, device=belief.device)
+
     for _ in range(self.optimisation_iters):
       # Evaluate J action sequences from the current belief (over entire sequence at once, batched over particles)
+      # For N optimization iterations:
+      #    sum over planning horizon <-- p(r_t | h_t, s_t) <-- h_t, s_t <-- transition_model( s_{t-1}, a_{t-1}) <-- clip actions <-- sample actions
+      #         |
+      #         --> select top_actions that gave higher return in planning horizon --> update mean and st_dev of best actions per time step in planning horizon
+      # Return the mean of the first action in the planning horizon
+      # ------------------------------------------------------------
+
       actions = (action_mean + action_std_dev * torch.randn(self.planning_horizon, B, self.candidates, self.action_size, device=action_mean.device)).view(self.planning_horizon, B * self.candidates, self.action_size)  # Sample actions (time x (batch x candidates) x actions)
       actions.clamp_(min=self.min_action, max=self.max_action)  # Clip action range
+
       # Sample next states
       beliefs, states, _, _ = self.transition_model(state, actions, belief)
+
       # Calculate expected returns (technically sum of rewards over planning horizon)
       returns = self.reward_model(beliefs.view(-1, H), states.view(-1, Z)).view(self.planning_horizon, -1).sum(dim=0)
+
       # Re-fit belief to the K best action sequences
       _, topk = returns.reshape(B, self.candidates).topk(self.top_candidates, dim=1, largest=True, sorted=False)
       topk += self.candidates * torch.arange(0, B, dtype=torch.int64, device=topk.device).unsqueeze(dim=1)  # Fix indices for unrolled actions
